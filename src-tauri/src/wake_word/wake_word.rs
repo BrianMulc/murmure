@@ -295,6 +295,7 @@ fn listener_loop(
         compute_overlap_samples(MAX_SEGMENT_OVERLAP_MS, sample_rate, max_samples);
 
     let stream_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let callback_alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let (stream, shared_buffer) = match config.sample_format() {
         cpal::SampleFormat::F32 => {
@@ -304,9 +305,11 @@ fn listener_loop(
                 VadState::new(max_samples, pre_buffer_capacity, max_overlap_samples, sb);
             let tx_clone = tx.clone();
             let stop_clone = stop.clone();
+            let alive = callback_alive.clone();
             let stream = device.build_input_stream(
                 &config.clone().into(),
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    alive.store(true, Ordering::SeqCst);
                     if stop_clone.load(Ordering::SeqCst) {
                         return;
                     }
@@ -330,9 +333,11 @@ fn listener_loop(
                 VadState::new(max_samples, pre_buffer_capacity, max_overlap_samples, sb);
             let tx_clone = tx.clone();
             let stop_clone = stop.clone();
+            let alive = callback_alive.clone();
             let stream = device.build_input_stream(
                 &config.clone().into(),
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    alive.store(true, Ordering::SeqCst);
                     if stop_clone.load(Ordering::SeqCst) {
                         return;
                     }
@@ -364,7 +369,7 @@ fn listener_loop(
         sample_rate
     );
 
-    let mut last_audio_time = std::time::Instant::now();
+    let mut last_callback_time = std::time::Instant::now();
     let mut last_early_check = std::time::Instant::now();
     let mut early_check_active = false;
     let min_early_samples =
@@ -378,7 +383,6 @@ fn listener_loop(
         // Use a shorter timeout to allow periodic early checks
         match rx.recv_timeout(std::time::Duration::from_millis(50)) {
             Ok(segment) => {
-                last_audio_time = std::time::Instant::now();
                 // A completed segment arrived (silence cutoff or max duration).
                 // Reset early check state since the segment is done.
                 early_check_active = false;
@@ -403,7 +407,11 @@ fn listener_loop(
                     warn!("Wake word stream error detected, exiting listener loop");
                     break;
                 }
-                if last_audio_time.elapsed()
+                // Update heartbeat from callback activity
+                if callback_alive.swap(false, Ordering::SeqCst) {
+                    last_callback_time = std::time::Instant::now();
+                }
+                if last_callback_time.elapsed()
                     >= std::time::Duration::from_secs(STREAM_INACTIVITY_TIMEOUT_S)
                 {
                     trace!(
