@@ -52,6 +52,7 @@ pub(crate) fn normalize_text(text: &str) -> String {
         .map(|w| match w {
             "okay" => "ok",
             "alice" => "alix",
+            "alex" => "alix",
             _ => w,
         })
         .collect::<Vec<&str>>()
@@ -785,10 +786,11 @@ fn trigger_cancel(app: &AppHandle) {
 }
 
 fn get_device(app: &AppHandle) -> anyhow::Result<cpal::Device> {
-    let audio_state = app.state::<AudioState>();
+    let settings = crate::settings::load_settings(app);
 
-    if let Some(device) = audio_state.get_cached_device() {
-        return Ok(device);
+    if let Some(ref mic_id) = settings.mic_id {
+        return crate::audio::microphone::resolve_device_for_recording(mic_id)
+            .map(|(device, _)| device);
     }
 
     let host = cpal::default_host();
@@ -827,6 +829,12 @@ mod tests {
     #[test]
     fn test_normalize_text_lowercase() {
         assert_eq!(normalize_text("MURMURE"), "murmure");
+    }
+
+    #[test]
+    fn test_normalize_text_alex_maps_to_alix() {
+        assert_eq!(normalize_text("alex"), "alix");
+        assert_eq!(normalize_text("Alex"), "alix");
     }
 
     #[test]
