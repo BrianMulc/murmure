@@ -1,6 +1,7 @@
-use crate::audio::helpers::resample;
+use crate::audio::helpers::resample_linear;
 use crate::audio::types::{AudioState, RecordingMode, RecordingTrigger};
 use crate::engine::transcription_engine::TranscriptionEngine;
+use crate::engine::ParakeetModelParams;
 use crate::shortcuts::types::{recording_state, RecordingSource};
 use crate::wake_word::types::{WakeWordAction, WakeWordEntry, WakeWordState};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -13,6 +14,7 @@ use strsim::levenshtein;
 use tauri::{AppHandle, Emitter, Manager};
 use unicode_normalization::UnicodeNormalization;
 
+const SPEECH_THRESHOLD: f32 = 0.015;
 const SILENCE_THRESHOLD: f32 = 0.01;
 const SPEECH_START_DELAY_MS: u64 = 120;
 const SPEECH_END_DELAY_MS: u64 = 400;
@@ -30,32 +32,6 @@ const EARLY_CHECK_INTERVAL_MS: u64 = 300;
 const EARLY_CHECK_MIN_BUFFER_MS: u64 = 400;
 /// Smoothing factor for exponential moving average of RMS energy.
 const EMA_ALPHA: f32 = 0.3;
-
-/// Minimum/maximum VAD speech thresholds mapped from sensitivity 0-100.
-/// 0 = most sensitive (0.003, picks up very quiet speech),
-/// 50 = default (0.015),
-/// 100 = least sensitive (0.030, needs loud speech).
-const SENSITIVITY_MIN_THRESHOLD: f32 = 0.003;
-const SENSITIVITY_MAX_THRESHOLD: f32 = 0.030;
-
-/// Convert sensitivity (0-100) to a VAD speech threshold.
-/// Higher sensitivity value → lower threshold → picks up quieter speech.
-fn sensitivity_to_threshold(sensitivity: u32) -> f32 {
-    let t = sensitivity as f32 / 100.0;
-    SENSITIVITY_MAX_THRESHOLD * t + SENSITIVITY_MIN_THRESHOLD * (1.0 - t)
-}
-
-/// Compute the Levenshtein distance threshold for a word given the
-/// user-configured match tolerance (0-3). Short words (≤3 chars) cap at
-/// one less to avoid matching unrelated short words.
-fn max_distance_for(word_len: usize, tolerance: u32) -> usize {
-    let base = tolerance as usize;
-    if word_len <= 3 {
-        base.min(1)
-    } else {
-        base.min(3)
-    }
-}
 
 /// Number of samples kept as overlap after a max-duration flush. Clamped so the
 /// retained tail can never be >= the segment itself, which would stall progress.
@@ -76,13 +52,14 @@ pub(crate) fn normalize_text(text: &str) -> String {
         .map(|w| match w {
             "okay" => "ok",
             "alice" => "alix",
+            "alex" => "alix",
             _ => w,
         })
         .collect::<Vec<&str>>()
         .join(" ")
 }
 
-fn matches_wake_word(transcription: &str, wake_word: &str, tolerance: u32) -> bool {
+fn matches_wake_word(transcription: &str, wake_word: &str) -> bool {
     if transcription.contains(wake_word) {
         return true;
     }
@@ -92,7 +69,7 @@ fn matches_wake_word(transcription: &str, wake_word: &str, tolerance: u32) -> bo
 
     if ww_words.len() == 1 {
         // Single-word wake word: fuzzy match per word
-        let max_distance = max_distance_for(wake_word.len(), tolerance);
+        let max_distance = if wake_word.len() <= 3 { 1 } else { 2 };
         tr_words
             .iter()
             .any(|word| levenshtein(word, wake_word) <= max_distance)
@@ -103,7 +80,7 @@ fn matches_wake_word(transcription: &str, wake_word: &str, tolerance: u32) -> bo
         }
         for window in tr_words.windows(ww_words.len()) {
             let all_match = window.iter().zip(ww_words.iter()).all(|(tw, ww)| {
-                let max_distance = max_distance_for(ww.len(), tolerance);
+                let max_distance = if ww.len() <= 3 { 1 } else { 2 };
                 levenshtein(tw, ww) <= max_distance
             });
             if all_match {
@@ -185,18 +162,8 @@ pub fn start_listener(app: &AppHandle) {
 
     let app_handle = app.clone();
 
-    let speech_threshold = sensitivity_to_threshold(settings.wake_word_sensitivity);
-    let match_tolerance = settings.wake_word_match_tolerance;
-
     let handle = std::thread::spawn(move || {
-        if let Err(e) = listener_loop(
-            &app_handle,
-            &entries,
-            &stop_signal,
-            &active,
-            speech_threshold,
-            match_tolerance,
-        ) {
+        if let Err(e) = listener_loop(&app_handle, &entries, &stop_signal, &active) {
             error!("Wake word listener error: {}", e);
         }
         active.store(false, Ordering::SeqCst);
@@ -249,7 +216,6 @@ fn try_handle_wake_word(
     text: &str,
     normalized: &str,
     entries: &[WakeWordEntry],
-    tolerance: u32,
     source: &str,
 ) -> bool {
     let is_recording = {
@@ -259,7 +225,7 @@ fn try_handle_wake_word(
     };
 
     for entry in entries {
-        if matches_wake_word(normalized, &entry.word, tolerance) {
+        if matches_wake_word(normalized, &entry.word) {
             match entry.action {
                 WakeWordAction::Record(mode) if !is_recording => {
                     info!(
@@ -276,10 +242,7 @@ fn try_handle_wake_word(
                         source, text, index
                     );
                     let _ = app.emit("wake-word-detected", ());
-                    // Silent: back-to-back show_recording_overlay (flash then
-                    // record) races webview creation and leaves the final
-                    // window invisible on Linux.
-                    crate::llm::switch_active_mode_silent(app, index);
+                    crate::llm::switch_active_mode(app, index);
                     trigger_recording(app, RecordingMode::Llm);
                     return true;
                 }
@@ -313,15 +276,11 @@ fn listener_loop(
     entries: &[WakeWordEntry],
     stop_signal: &Arc<std::sync::atomic::AtomicBool>,
     active: &Arc<std::sync::atomic::AtomicBool>,
-    speech_threshold: f32,
-    match_tolerance: u32,
 ) -> anyhow::Result<()> {
     let device = get_device(app)?;
     let config = device
         .default_input_config()
-        .map_err(|e| {
-            anyhow::anyhow!("No input config: {}", e)
-        })?;
+        .map_err(|e| anyhow::anyhow!("No input config: {}", e))?;
 
     let sample_rate = config.sample_rate() as usize;
     let channels = config.channels() as usize;
@@ -336,81 +295,81 @@ fn listener_loop(
         compute_overlap_samples(MAX_SEGMENT_OVERLAP_MS, sample_rate, max_samples);
 
     let stream_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let callback_alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Tracks the last time the audio callback delivered data, in millis since
-    // the listener loop started. Used to detect truly dead streams (no data
-    // at all) without falsely firing when the user simply isn't speaking.
-    let last_callback_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let loop_start = std::time::Instant::now();
-
-    let base_config: cpal::StreamConfig = config.clone().into();
-
-    let try_build = |stream_config: &cpal::StreamConfig| -> Result<
-        (cpal::Stream, SharedBuffer),
-        cpal::BuildStreamError,
-    > {
-        let sb = new_shared_buffer(max_samples);
-        let sb_ret = sb.clone();
-        let mut vad_state =
-            VadState::new(max_samples, pre_buffer_capacity, max_overlap_samples, sb, speech_threshold);
-        let tx_clone = tx.clone();
-        let stop_clone = stop.clone();
-        let se = stream_error.clone();
-        let cb_timer = last_callback_ms.clone();
-        let cb_start = loop_start;
-        let err_fn = move |err| {
-            error!("Wake word stream error: {}", err);
-            se.store(true, Ordering::SeqCst);
-        };
-        let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => device.build_input_stream(
-                stream_config,
+    let (stream, shared_buffer) = match config.sample_format() {
+        cpal::SampleFormat::F32 => {
+            let sb = new_shared_buffer(max_samples);
+            let sb_ret = sb.clone();
+            let mut vad_state =
+                VadState::new(max_samples, pre_buffer_capacity, max_overlap_samples, sb);
+            let tx_clone = tx.clone();
+            let stop_clone = stop.clone();
+            let alive = callback_alive.clone();
+            let stream = device.build_input_stream(
+                &config.clone().into(),
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    alive.store(true, Ordering::SeqCst);
                     if stop_clone.load(Ordering::SeqCst) {
                         return;
                     }
-                    cb_timer.store(cb_start.elapsed().as_millis() as u64, Ordering::Relaxed);
                     process_audio_callback(data, channels, &mut vad_state, &tx_clone);
                 },
-                err_fn,
+                {
+                    let se = stream_error.clone();
+                    move |err| {
+                        error!("Wake word stream error: {}", err);
+                        se.store(true, Ordering::SeqCst);
+                    }
+                },
                 None,
-            )?,
-            cpal::SampleFormat::I16 => device.build_input_stream(
-                stream_config,
+            )?;
+            (stream, sb_ret)
+        }
+        cpal::SampleFormat::I16 => {
+            let sb = new_shared_buffer(max_samples);
+            let sb_ret = sb.clone();
+            let mut vad_state =
+                VadState::new(max_samples, pre_buffer_capacity, max_overlap_samples, sb);
+            let tx_clone = tx.clone();
+            let stop_clone = stop.clone();
+            let alive = callback_alive.clone();
+            let stream = device.build_input_stream(
+                &config.clone().into(),
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    alive.store(true, Ordering::SeqCst);
                     if stop_clone.load(Ordering::SeqCst) {
                         return;
                     }
-                    cb_timer.store(cb_start.elapsed().as_millis() as u64, Ordering::Relaxed);
                     let f32_data: Vec<f32> =
                         data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
                     process_audio_callback(&f32_data, channels, &mut vad_state, &tx_clone);
                 },
-                err_fn,
+                {
+                    let se = stream_error.clone();
+                    move |err| {
+                        error!("Wake word stream error: {}", err);
+                        se.store(true, Ordering::SeqCst);
+                    }
+                },
                 None,
-            )?,
-            f => {
-                error!("Unsupported sample format: {:?}", f);
-                return Err(cpal::BuildStreamError::StreamConfigNotSupported);
-            }
-        };
-        Ok((stream, sb_ret))
+            )?;
+            (stream, sb_ret)
+        }
+        f => return Err(anyhow::anyhow!("Unsupported sample format: {:?}", f)),
     };
-
-    let (stream, shared_buffer) =
-        crate::audio::helpers::build_input_with_buffer_fallback(&base_config, try_build)
-            .map_err(|e| {
-                e
-            })?;
 
     stream
         .play()
-        .map_err(|e| {
-            anyhow::anyhow!("Failed to start wake word stream: {}", e)
-        })?;
+        .map_err(|e| anyhow::anyhow!("Failed to start wake word stream: {}", e))?;
 
     active.store(true, Ordering::SeqCst);
+    trace!(
+        "Wake word listener loop running (sample_rate={})",
+        sample_rate
+    );
 
+    let mut last_callback_time = std::time::Instant::now();
     let mut last_early_check = std::time::Instant::now();
     let mut early_check_active = false;
     let min_early_samples =
@@ -435,7 +394,12 @@ fn listener_loop(
                 if let Some((text, normalized)) =
                     resample_and_transcribe(app, &segment, sample_rate)
                 {
-                    try_handle_wake_word(app, &text, &normalized, entries, match_tolerance, "segment");
+                    trace!(
+                        "Wake word segment transcription: \"{}\" (normalized: \"{}\")",
+                        text,
+                        normalized
+                    );
+                    try_handle_wake_word(app, &text, &normalized, entries, "segment");
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -443,16 +407,17 @@ fn listener_loop(
                     warn!("Wake word stream error detected, exiting listener loop");
                     break;
                 }
-                // Check if the audio callback is still delivering data. We use
-                // the callback timer (updated by process_audio_callback) rather
-                // than last_segment_time, because segments are only produced
-                // when speech is detected — silence should NOT count as
-                // inactivity.
-                let cb_elapsed_ms = loop_start.elapsed().as_millis() as u64
-                    - last_callback_ms.load(Ordering::Relaxed);
-                if last_callback_ms.load(Ordering::Relaxed) > 0
-                    && cb_elapsed_ms >= STREAM_INACTIVITY_TIMEOUT_S * 1000
+                // Update heartbeat from callback activity
+                if callback_alive.swap(false, Ordering::SeqCst) {
+                    last_callback_time = std::time::Instant::now();
+                }
+                if last_callback_time.elapsed()
+                    >= std::time::Duration::from_secs(STREAM_INACTIVITY_TIMEOUT_S)
                 {
+                    trace!(
+                        "No audio data received for {}s, stream presumed dead",
+                        STREAM_INACTIVITY_TIMEOUT_S
+                    );
                     break;
                 }
 
@@ -491,7 +456,7 @@ fn listener_loop(
                                 text,
                                 normalized
                             );
-                            if try_handle_wake_word(app, &text, &normalized, entries, match_tolerance, "early") {
+                            if try_handle_wake_word(app, &text, &normalized, entries, "early") {
                                 // Wake word detected early, drain pending
                                 // segments to avoid duplicate triggers
                                 while rx.try_recv().is_ok() {}
@@ -544,7 +509,6 @@ struct VadState {
     smoothed_rms: f32,
     last_check: std::time::Instant,
     shared_buffer: SharedBuffer,
-    speech_threshold: f32,
 }
 
 impl VadState {
@@ -553,7 +517,6 @@ impl VadState {
         pre_buffer_capacity: usize,
         max_overlap_samples: usize,
         shared_buffer: SharedBuffer,
-        speech_threshold: f32,
     ) -> Self {
         Self {
             buffer: Vec::with_capacity(max_samples),
@@ -569,7 +532,6 @@ impl VadState {
             smoothed_rms: 0.0,
             last_check: std::time::Instant::now(),
             shared_buffer,
-            speech_threshold,
         }
     }
 
@@ -632,7 +594,7 @@ fn process_audio_callback(
     state.smoothed_rms = EMA_ALPHA * rms + (1.0 - EMA_ALPHA) * state.smoothed_rms;
 
     if !state.speech_active {
-        if state.smoothed_rms > state.speech_threshold {
+        if state.smoothed_rms > SPEECH_THRESHOLD {
             match state.speech_start_time {
                 Some(start) => {
                     if start.elapsed() >= std::time::Duration::from_millis(SPEECH_START_DELAY_MS) {
@@ -643,8 +605,8 @@ fn process_audio_callback(
                         state.buffer.extend(state.pre_buffer.drain(..));
                         state.sync_shared_buffer();
                         trace!(
-                            "VAD: SPEECH STARTED (rms={:.5} smoothed={:.5} pre_buffer={} samples)",
-                            rms, state.smoothed_rms, state.buffer.len()
+                            "Wake word VAD: speech started (pre-buffer: {} samples)",
+                            state.buffer.len()
                         );
                     }
                 }
@@ -668,11 +630,6 @@ fn process_audio_callback(
                         state.silence_start_time = None;
                         state.speech_start_time = None;
                         state.sync_shared_buffer();
-
-                        trace!(
-                            "VAD: SPEECH ENDED, segment sent ({} samples)",
-                            segment.len()
-                        );
 
                         if !segment.is_empty() {
                             let _ = tx.send(segment);
@@ -709,7 +666,7 @@ fn resample_and_transcribe(
     sample_rate: usize,
 ) -> Option<(String, String)> {
     let samples_16k = if sample_rate != 16000 {
-        resample(samples, sample_rate, 16000)
+        resample_linear(samples, sample_rate, 16000)
     } else {
         samples.to_vec()
     };
@@ -741,9 +698,10 @@ fn transcribe_segment(app: &AppHandle, samples: Vec<f32>) -> anyhow::Result<Stri
                 .get_model_path()
                 .map_err(|e| anyhow::anyhow!("Failed to get model path: {}", e))?;
 
-            let new_engine =
-                crate::engine::ParakeetEngine::load_int8(&model_path, model.get_tokenizer_path())
-                    .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
+            let mut new_engine = crate::engine::ParakeetEngine::new();
+            new_engine
+                .load_model_with_params(&model_path, ParakeetModelParams::int8())
+                .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
 
             *engine_guard = Some(new_engine);
             debug!("Model loaded for wake word detection");
@@ -755,13 +713,6 @@ fn transcribe_segment(app: &AppHandle, samples: Vec<f32>) -> anyhow::Result<Stri
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("Engine not loaded"))?;
 
-    // The engine is shared with dictation; resync so the boost tree reflects
-    // the current dictionary instead of whatever the last dictation armed.
-    crate::dictionary::sync_boost_words(
-        engine,
-        &app.state::<crate::dictionary::Dictionary>().get(),
-    );
-
     let result = engine
         .transcribe_samples(samples, None)
         .map_err(|e| anyhow::anyhow!("Transcription failed: {}", e))?;
@@ -770,9 +721,6 @@ fn transcribe_segment(app: &AppHandle, samples: Vec<f32>) -> anyhow::Result<Stri
 }
 
 fn trigger_recording(app: &AppHandle, mode: RecordingMode) {
-    // The listener stays active during recording so that cancel/validate/submit
-    // wake words can be detected. On Windows (WASAPI shared mode) and most
-    // platforms, multiple cpal input streams on the same device coexist.
     let audio_state = app.state::<AudioState>();
     audio_state.set_recording_trigger(RecordingTrigger::WakeWord);
 
@@ -827,8 +775,8 @@ fn trigger_submit(app: &AppHandle) {
 
     // Submit presses Enter only after transcription succeeded
     if path.is_some() {
-        match crate::audio::simulate_enter_key(app) {
-            Ok(()) => info!("Submit wake word auto-enter handler completed"),
+        match crate::audio::simulate_enter_key() {
+            Ok(()) => info!("Enter key simulated by submit wake word"),
             Err(e) => error!("Failed to simulate Enter key: {}", e),
         }
     } else {
@@ -846,10 +794,11 @@ fn trigger_cancel(app: &AppHandle) {
 }
 
 fn get_device(app: &AppHandle) -> anyhow::Result<cpal::Device> {
-    let audio_state = app.state::<AudioState>();
+    let settings = crate::settings::load_settings(app);
 
-    if let Some(device) = audio_state.get_cached_device() {
-        return Ok(device);
+    if let Some(ref mic_id) = settings.mic_id {
+        return crate::audio::microphone::resolve_device_for_recording(mic_id)
+            .map(|(device, _)| device);
     }
 
     let host = cpal::default_host();
@@ -891,6 +840,12 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_text_alex_maps_to_alix() {
+        assert_eq!(normalize_text("alex"), "alix");
+        assert_eq!(normalize_text("Alex"), "alix");
+    }
+
+    #[test]
     fn test_normalize_text_accents() {
         assert_eq!(normalize_text("murmùre"), "murmure");
         assert_eq!(normalize_text("écoute"), "ecoute");
@@ -917,85 +872,84 @@ mod tests {
 
     #[test]
     fn test_matches_wake_word_exact_substring() {
-        assert!(matches_wake_word("bonjour murmure comment", "murmure", 2));
+        assert!(matches_wake_word("bonjour murmure comment", "murmure"));
     }
 
     #[test]
     fn test_matches_wake_word_exact_word() {
-        assert!(matches_wake_word("murmure", "murmure", 2));
+        assert!(matches_wake_word("murmure", "murmure"));
     }
 
     #[test]
     fn test_matches_wake_word_levenshtein_one_char() {
         // 1 edit distance: "murmur" vs "murmure" (missing 'e')
-        assert!(matches_wake_word("murmur", "murmure", 2));
+        assert!(matches_wake_word("murmur", "murmure"));
         // 1 edit distance: "murmurre" vs "murmure" (extra 'r')
-        assert!(matches_wake_word("murmurre", "murmure", 2));
+        assert!(matches_wake_word("murmurre", "murmure"));
         // 1 edit distance: "nurmure" vs "murmure" (substitution)
-        assert!(matches_wake_word("nurmure", "murmure", 2));
+        assert!(matches_wake_word("nurmure", "murmure"));
     }
 
     #[test]
     fn test_matches_wake_word_levenshtein_two_chars() {
         // 2 edit distance for 7-char word (threshold=2): should match
-        assert!(matches_wake_word("mirmur", "murmure", 2));
+        assert!(matches_wake_word("mirmur", "murmure"));
     }
 
     #[test]
     fn test_matches_wake_word_too_distant() {
         // 3+ edit distance: should NOT match
-        assert!(!matches_wake_word("miracle", "murmure", 2));
+        assert!(!matches_wake_word("miracle", "murmure"));
     }
 
     #[test]
     fn test_matches_wake_word_short_word() {
         // 4+ chars: threshold=2
-        assert!(matches_wake_word("helo", "hello", 2));
-        assert!(matches_wake_word("alice", "alix", 2));
+        assert!(matches_wake_word("helo", "hello"));
+        assert!(matches_wake_word("alice", "alix"));
         // <=3 chars: threshold=1
-        assert!(matches_wake_word("ot", "ok", 2));
-        assert!(!matches_wake_word("ab", "ok", 2));
+        assert!(matches_wake_word("ot", "ok"));
+        assert!(!matches_wake_word("ab", "ok"));
     }
 
     #[test]
     fn test_matches_wake_word_in_sentence() {
         assert!(matches_wake_word(
             "bonjour nurmure comment ca va",
-            "murmure",
-            2
+            "murmure"
         ));
     }
 
     #[test]
     fn test_matches_wake_word_no_match() {
-        assert!(!matches_wake_word("bonjour comment ca va", "murmure", 2));
+        assert!(!matches_wake_word("bonjour comment ca va", "murmure"));
     }
 
     #[test]
     fn test_matches_multi_word_exact() {
-        assert!(matches_wake_word("ok murmure", "ok murmure", 2));
+        assert!(matches_wake_word("ok murmure", "ok murmure"));
     }
 
     #[test]
     fn test_matches_multi_word_in_sentence() {
-        assert!(matches_wake_word("bonjour ok murmure merci", "ok murmure", 2));
+        assert!(matches_wake_word("bonjour ok murmure merci", "ok murmure"));
     }
 
     #[test]
     fn test_matches_multi_word_fuzzy() {
         // "oc" is 1 edit from "ok" (<=3 chars, threshold=1)
         // "murmur" is 1 edit from "murmure" (>3 chars, threshold=2)
-        assert!(matches_wake_word("oc murmur", "ok murmure", 2));
+        assert!(matches_wake_word("oc murmur", "ok murmure"));
     }
 
     #[test]
     fn test_matches_multi_word_no_match() {
-        assert!(!matches_wake_word("bonjour murmure", "ok murmure", 2));
+        assert!(!matches_wake_word("bonjour murmure", "ok murmure"));
     }
 
     #[test]
     fn test_matches_multi_word_too_short() {
-        assert!(!matches_wake_word("ok", "ok murmure", 2));
+        assert!(!matches_wake_word("ok", "ok murmure"));
     }
 
     #[test]
@@ -1019,30 +973,30 @@ mod tests {
     #[test]
     fn test_matches_okay_alix_wake_word() {
         let normalized = normalize_text("Okay Alix");
-        assert!(matches_wake_word(&normalized, "ok alix", 2));
+        assert!(matches_wake_word(&normalized, "ok alix"));
     }
 
     #[test]
     fn test_matches_alice_wake_word() {
         let normalized = normalize_text("Ok Alice");
-        assert!(matches_wake_word(&normalized, "ok alix", 2));
+        assert!(matches_wake_word(&normalized, "ok alix"));
 
         let normalized = normalize_text("Alice command");
-        assert!(matches_wake_word(&normalized, "alix command", 2));
+        assert!(matches_wake_word(&normalized, "alix command"));
 
         let normalized = normalize_text("Alice cancel");
-        assert!(matches_wake_word(&normalized, "alix cancel", 2));
+        assert!(matches_wake_word(&normalized, "alix cancel"));
 
         let normalized = normalize_text("merci Alix");
-        assert!(matches_wake_word(&normalized, "merci alix", 2));
+        assert!(matches_wake_word(&normalized, "merci alix"));
 
         let normalized = normalize_text("merci Alice");
-        assert!(matches_wake_word(&normalized, "merci alix", 2));
+        assert!(matches_wake_word(&normalized, "merci alix"));
 
         let normalized = normalize_text("OK, Alice.");
-        assert!(matches_wake_word(&normalized, "ok alix", 2));
+        assert!(matches_wake_word(&normalized, "ok alix"));
 
         let normalized = normalize_text("Okay, Alice.");
-        assert!(matches_wake_word(&normalized, "ok alix", 2));
+        assert!(matches_wake_word(&normalized, "ok alix"));
     }
 }
