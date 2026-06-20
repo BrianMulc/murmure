@@ -124,6 +124,7 @@ impl AudioState {
     }
 }
 
+#[derive(Debug)]
 pub(super) enum RecorderStartError {
     Busy,
     DirUnavailable,
