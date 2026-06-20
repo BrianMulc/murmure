@@ -60,6 +60,13 @@ pub struct AppSettings {
     pub wake_word_submit: String,
     pub auto_enter_after_wake_word: bool,
     pub silence_timeout_ms: u64,
+    /// Microphone sensitivity for wake word detection (0-100).
+    /// 0 = most sensitive (picks up quiet speech), 100 = least sensitive.
+    /// Maps to VAD speech threshold: 0→0.003, 50→0.015, 100→0.030.
+    pub wake_word_sensitivity: u32,
+    /// Fuzzy matching tolerance for wake words (0-3).
+    /// 0 = exact match only, 1 = allow 1 edit, 2 = default, 3 = very fuzzy.
+    pub wake_word_match_tolerance: u32,
     pub show_in_dock: bool,
     pub smartmic_enabled: bool,
     pub smartmic_port: u16,
@@ -164,6 +171,8 @@ impl Default for AppSettings {
             wake_word_submit: "thank you alix".to_string(),
             auto_enter_after_wake_word: false,
             silence_timeout_ms: 1500,
+            wake_word_sensitivity: 50,
+            wake_word_match_tolerance: 2,
             show_in_dock: true,
             smartmic_enabled: false,
             smartmic_port: 4801,

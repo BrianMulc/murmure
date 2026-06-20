@@ -169,6 +169,37 @@ pub fn set_silence_timeout_ms(app: AppHandle, value: u64) -> Result<(), String> 
 }
 
 #[command]
+pub fn get_wake_word_sensitivity(app: AppHandle) -> Result<u32, String> {
+    let s = crate::settings::load_settings(&app);
+    Ok(s.wake_word_sensitivity)
+}
+
+#[command]
+pub fn set_wake_word_sensitivity(app: AppHandle, value: u32) -> Result<(), String> {
+    let clamped = value.clamp(0, 100);
+    let mut s = crate::settings::load_settings(&app);
+    s.wake_word_sensitivity = clamped;
+    crate::settings::save_settings(&app, &s)?;
+    restart_listener_if_active(&app, &s);
+    Ok(())
+}
+
+#[command]
+pub fn get_wake_word_match_tolerance(app: AppHandle) -> Result<u32, String> {
+    let s = crate::settings::load_settings(&app);
+    Ok(s.wake_word_match_tolerance)
+}
+
+#[command]
+pub fn set_wake_word_match_tolerance(app: AppHandle, value: u32) -> Result<(), String> {
+    let clamped = value.clamp(0, 3);
+    let mut s = crate::settings::load_settings(&app);
+    s.wake_word_match_tolerance = clamped;
+    crate::settings::save_settings(&app, &s)?;
+    Ok(())
+}
+
+#[command]
 pub fn get_auto_enter_after_wake_word(app: AppHandle) -> Result<bool, String> {
     let s = crate::settings::load_settings(&app);
     Ok(s.auto_enter_after_wake_word)
