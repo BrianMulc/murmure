@@ -62,7 +62,7 @@ fn internal_record_audio(app: &AppHandle) {
             crate::audio::streaming::start_streaming(app, &state, sample_rate);
         }
         Err(RecorderStartError::InitFailed) => notify_recording_error(app),
-        Err(_) => {}
+        Err(e) => error!("Failed to start recording: {:?}", e),
     }
 }
 

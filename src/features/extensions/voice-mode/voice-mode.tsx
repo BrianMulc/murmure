@@ -8,6 +8,8 @@ import { useTranslation } from '@/i18n';
 import { useLlmOnboardingCompleted } from '@/features/extensions/llm-connect/hooks/use-llm-onboarding-completed';
 import { useWakeWordEnabled } from './hooks/use-wake-word-enabled';
 import { useSilenceTimeout } from './hooks/use-silence-timeout';
+import { useWakeWordSensitivity } from './hooks/use-wake-word-sensitivity';
+import { useWakeWordMatchTolerance } from './hooks/use-wake-word-match-tolerance';
 import { useWakeWord, WAKE_WORD_CONFIGS } from './hooks/use-wake-word';
 import { VoiceTriggerItem } from './voice-trigger-item/voice-trigger-item';
 import { VoiceModeCta } from './voice-mode-cta/voice-mode-cta';
@@ -19,6 +21,8 @@ export const VoiceMode = () => {
     const llmOnboardingCompleted = useLlmOnboardingCompleted();
     const { enabled, setEnabled } = useWakeWordEnabled();
     const { silenceTimeoutMs, setSilenceTimeoutMs } = useSilenceTimeout();
+    const { sensitivity, setSensitivity } = useWakeWordSensitivity();
+    const { matchTolerance, setMatchTolerance } = useWakeWordMatchTolerance();
 
     const isLoaded = enabled !== null;
 
@@ -196,6 +200,49 @@ export const VoiceMode = () => {
                                         formatValue={(v) => (v > 5000 ? t('Indefinite') : `${(v / 1000).toFixed(1)}s`)}
                                         className="w-28"
                                         data-testid="silence-timeout-slider"
+                                    />
+                                </SettingsUI.Item>
+                                <SettingsUI.Separator />
+                                <SettingsUI.Item>
+                                    <SettingsUI.Description>
+                                        <Typography.Title>{t('Microphone sensitivity')}</Typography.Title>
+                                        <Typography.Paragraph>
+                                            {t('Higher detects quieter speech')}
+                                        </Typography.Paragraph>
+                                    </SettingsUI.Description>
+                                    <Slider
+                                        value={[100 - sensitivity]}
+                                        onValueChange={([value]) => setSensitivity(100 - value)}
+                                        min={0}
+                                        max={100}
+                                        step={5}
+                                        showValue
+                                        formatValue={(v) => `${v}%`}
+                                        className="w-28"
+                                        data-testid="wake-word-sensitivity-slider"
+                                    />
+                                </SettingsUI.Item>
+                                <SettingsUI.Separator />
+                                <SettingsUI.Item>
+                                    <SettingsUI.Description>
+                                        <Typography.Title>{t('Match tolerance')}</Typography.Title>
+                                        <Typography.Paragraph>
+                                            {t('Higher accepts more transcription errors')}
+                                        </Typography.Paragraph>
+                                    </SettingsUI.Description>
+                                    <Slider
+                                        value={[matchTolerance]}
+                                        onValueChange={([value]) => setMatchTolerance(value)}
+                                        min={0}
+                                        max={3}
+                                        step={1}
+                                        showValue
+                                        formatValue={(v) => {
+                                            const labels = [t('Exact'), t('Strict'), t('Default'), t('Relaxed')];
+                                            return labels[v] ?? `${v}`;
+                                        }}
+                                        className="w-28"
+                                        data-testid="wake-word-match-tolerance-slider"
                                     />
                                 </SettingsUI.Item>
                             </SettingsUI.Container>
