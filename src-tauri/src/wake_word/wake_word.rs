@@ -1,4 +1,4 @@
-use crate::audio::helpers::resample_linear;
+use crate::audio::helpers::resample;
 use crate::audio::types::{AudioState, RecordingMode, RecordingTrigger};
 use crate::engine::transcription_engine::TranscriptionEngine;
 use crate::engine::ParakeetModelParams;
@@ -666,7 +666,7 @@ fn resample_and_transcribe(
     sample_rate: usize,
 ) -> Option<(String, String)> {
     let samples_16k = if sample_rate != 16000 {
-        resample_linear(samples, sample_rate, 16000)
+        resample(samples, sample_rate, 16000)
     } else {
         samples.to_vec()
     };
@@ -775,7 +775,7 @@ fn trigger_submit(app: &AppHandle) {
 
     // Submit presses Enter only after transcription succeeded
     if path.is_some() {
-        match crate::audio::simulate_enter_key() {
+        match crate::audio::simulate_enter_key(app) {
             Ok(()) => info!("Enter key simulated by submit wake word"),
             Err(e) => error!("Failed to simulate Enter key: {}", e),
         }
